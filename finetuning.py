@@ -1,169 +1,55 @@
-# Phase 3.1 & 3.2: Dataset conversion and Reward Model Training
+from datasets import load_dataset, DatasetDict
+from sklearn.model_selection import train_test_split
 
-import json
-import random
-from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Dict
+# 1) Load your .json (expects a top-level list of dicts)
+# If your file is simply `[ {...}, {...}, ... ]`, you can do:
+raw = load_dataset("json", data_files="path/to/your/input.json", field=None)
 
-import torch
-from datasets import Dataset, DatasetDict, load_metric
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
-from trl import RewardTrainer, PairwiseDataCollator, create_reference_model_and_tokenizer
+# raw is a DatasetDict with a single split named "train"
+# (even though it's the entire file)
+print(raw)  
+# DatasetDict({
+#     train: Dataset({
+#         features: [...],
+#         num_rows: ...
+#     })
+# })
 
-from dataclasses import dataclass
-from typing import List, Dict, Optional
-import torch
-from transformers import PreTrainedTokenizer, DataCollatorWithPadding
+# 2) Split into train/validation/test (e.g. 80/10/10):
+train_val, test = raw["train"].train_test_split(test_size=0.1, seed=42).values()
+train, val   = train_val.train_test_split(test_size=0.1111, seed=42).values()
+# 0.1111 of 90% ≈ 10% of original
 
-@dataclass
-class PairwiseDataCollator:
-    """
-    Collate a batch of dicts with keys:
-      - chosen_input_ids
-      - chosen_attention_mask
-      - rejected_input_ids
-      - rejected_attention_mask
-    into a single padded batch.
-    """
-    tokenizer: PreTrainedTokenizer
-    padding: bool = True
-    max_length: Optional[int] = None
+data = DatasetDict({
+    "train": train,
+    "validation": val,
+    "test": test,
+})
 
-    def __call__(self, features: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
-        # split out the chosen vs rejected examples
-        chosen_feats  = [
-            {"input_ids": f["chosen_input_ids"],  "attention_mask": f["chosen_attention_mask"]}
-            for f in features
-        ]
-        rejected_feats = [
-            {"input_ids": f["rejected_input_ids"], "attention_mask": f["rejected_attention_mask"]}
-            for f in features
-        ]
+# 3) Convert each example into a pairwise dict:
+#    assuming each record has "c_response" and "r_response"
+#    and you’ve already tokenized prompts+responses to match your reward model’s inputs.
 
-        # use HF’s DataCollatorWithPadding to pad each side
-        padder = DataCollatorWithPadding(
-            tokenizer=self.tokenizer,
-            padding="longest",
-            max_length=self.max_length,
-        )
-        chosen_batch  = padder(chosen_feats)
-        rejected_batch = padder(rejected_feats)
+from transformers import AutoTokenizer
 
-        return {
-            "input_ids_chosen":      chosen_batch["input_ids"],
-            "attention_mask_chosen": chosen_batch["attention_mask"],
-            "input_ids_rejected":     rejected_batch["input_ids"],
-            "attention_mask_rejected":rejected_batch["attention_mask"],
-        }
+tokenizer = AutoTokenizer.from_pretrained("your-base-model")
 
-INPUT_FILE = "grader_dataset.jsonl"  # your raw JSONL
-OUTPUT_DIR = Path("processed_data")
-OUTPUT_DIR.mkdir(exist_ok=True)
+def make_pair(ex):
+    # concatenate prompt + response, then tokenize
+    chosen = tokenizer(ex["prompt"] + ex["c_response"], truncation=True)
+    rejected = tokenizer(ex["prompt"] + ex["r_response"], truncation=True)
 
-def load_raw(path: str) -> List[Dict]:
-    examples = []
-    with open(path) as f:
-        for line in f:
-            examples.append(json.loads(line))
-    return examples
+    return {
+        "chosen_input_ids":      chosen["input_ids"],
+        "chosen_attention_mask": chosen["attention_mask"],
+        "rejected_input_ids":     rejected["input_ids"],
+        "rejected_attention_mask":rejected["attention_mask"],
+    }
 
-def to_pairwise(examples: List[Dict]) -> List[Dict]:
-    pairs = []
-    for ex in examples:
-        prompt = ex["prompt"].strip()
-        chosen = ex["c_response"].strip()
-        rejected = ex["r_response"].strip()
-        # normalize finish bracket
-        # ensure single Action: Finish[...] at end:
-        chosen = chosen.split("Action:")[0].strip() + "\nAction:" + chosen.split("Action:")[-1]
-        rejected = rejected.split("Action:")[0].strip() + "\nAction:" + rejected.split("Action:")[-1]
-        pairs.append({"prompt": prompt, "chosen": chosen, "rejected": rejected, "idx": ex["idx"]})
-    return pairs
+data = data.map(make_pair, remove_columns=raw["train"].column_names)
 
-raw = load_raw(INPUT_FILE)
-pairs = to_pairwise(raw)
+# now `data["train"]`, `data["validation"]`, `data["test"]` each have the four
+# fields your RewardTrainer will expect.
 
-# train/val/test split by idx
-idxs = list({p["idx"] for p in pairs})
-random.shuffle(idxs)
-n = len(idxs)
-train_ids = set(idxs[:int(n*0.8)])
-val_ids   = set(idxs[int(n*0.8):int(n*0.9)])
-test_ids  = set(idxs[int(n*0.9):])
-
-splits = {"train": [], "validation": [], "test": []}
-for p in pairs:
-    if p["idx"] in train_ids:
-        splits["train"].append(p)
-    elif p["idx"] in val_ids:
-        splits["validation"].append(p)
-    else:
-        splits["test"].append(p)
-
-ds = DatasetDict({k: Dataset.from_list(v) for k,v in splits.items()})
-for split in ds:
-    ds[split].to_json(OUTPUT_DIR / f"{split}.jsonl")
-
-print("Dataset splits saved to", OUTPUT_DIR)
-
-# --- Phase 3.2: Fine-tune a reward model on pairwise data ---
-
-MODEL_NAME = "huggyllama/llama-7b"  # or your chosen base
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
-# create model with scalar head
-model = AutoModelForSequenceClassification.from_pretrained(
-    MODEL_NAME, num_labels=1
-)
-
-# Preprocessing
-def tokenize_pair(ex):
-    # we'll concatenate prompt + response
-    chosen_text = ex["prompt"] + "\n" + ex["chosen"]
-    rejected_text = ex["prompt"] + "\n" + ex["rejected"]
-    c = tokenizer(chosen_text, truncation=True, max_length=512)
-    r = tokenizer(rejected_text, truncation=True, max_length=512)
-    return {"input_ids_chosen": c["input_ids"], "attention_mask_chosen": c["attention_mask"],
-            "input_ids_rejected": r["input_ids"], "attention_mask_rejected": r["attention_mask"]}
-
-tokenized = ds.map(tokenize_pair, remove_columns=ds["train"].column_names)
-
-# DataCollider for pairwise
-data_collator = PairwiseDataCollator(tokenizer)
-
-# TrainingArguments
-training_args = TrainingArguments(
-    output_dir="reward_model",
-    evaluation_strategy="epoch",
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
-    learning_rate=1e-5,
-    num_train_epochs=3,
-    logging_steps=50,
-    save_total_limit=2,
-    fp16=torch.cuda.is_available()
-)
-
-# Metric: accuracy of preferring chosen over rejected
-metric = load_metric("accuracy")
-
-def compute_metrics(eval_preds):
-    scores_chosen, scores_rejected, _ = eval_preds
-    preds = (scores_chosen > scores_rejected).long()
-    labels = torch.ones_like(preds)
-    acc = metric.compute(predictions=preds.cpu().numpy(), references=labels.cpu().numpy())["accuracy"]
-    return {"accuracy": acc}
-
-
-trainer = RewardTrainer(
-    model=model,
-    args=training_args,
-    train_dataset=tokenized["train"],
-    eval_dataset=tokenized["validation"],
-    data_collator=data_collator,
-    tokenizer=tokenizer,
-    compute_metrics=compute_metrics
-)
-
-trainer.train()
-trainer.save_model("reward_model")
+# Save or inspect
+print(data)
