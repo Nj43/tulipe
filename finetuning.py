@@ -11,7 +11,51 @@ from datasets import Dataset, DatasetDict, load_metric
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
 from trl import RewardTrainer, PairwiseDataCollator, create_reference_model_and_tokenizer
 
-# --- Phase 3.1: Prepare pairwise preference dataset ---
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+import torch
+from transformers import PreTrainedTokenizer, DataCollatorWithPadding
+
+@dataclass
+class PairwiseDataCollator:
+    """
+    Collate a batch of dicts with keys:
+      - chosen_input_ids
+      - chosen_attention_mask
+      - rejected_input_ids
+      - rejected_attention_mask
+    into a single padded batch.
+    """
+    tokenizer: PreTrainedTokenizer
+    padding: bool = True
+    max_length: Optional[int] = None
+
+    def __call__(self, features: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
+        # split out the chosen vs rejected examples
+        chosen_feats  = [
+            {"input_ids": f["chosen_input_ids"],  "attention_mask": f["chosen_attention_mask"]}
+            for f in features
+        ]
+        rejected_feats = [
+            {"input_ids": f["rejected_input_ids"], "attention_mask": f["rejected_attention_mask"]}
+            for f in features
+        ]
+
+        # use HF’s DataCollatorWithPadding to pad each side
+        padder = DataCollatorWithPadding(
+            tokenizer=self.tokenizer,
+            padding="longest",
+            max_length=self.max_length,
+        )
+        chosen_batch  = padder(chosen_feats)
+        rejected_batch = padder(rejected_feats)
+
+        return {
+            "input_ids_chosen":      chosen_batch["input_ids"],
+            "attention_mask_chosen": chosen_batch["attention_mask"],
+            "input_ids_rejected":     rejected_batch["input_ids"],
+            "attention_mask_rejected":rejected_batch["attention_mask"],
+        }
 
 INPUT_FILE = "grader_dataset.jsonl"  # your raw JSONL
 OUTPUT_DIR = Path("processed_data")
