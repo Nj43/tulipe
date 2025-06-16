@@ -1,36 +1,5 @@
 import json
-
-def prepare_pairwise_jsonl(input_json_path: str, output_jsonl_path: str):
-    """
-    Reads a JSON list where each item has fields:
-      - "prompt"
-      - "c_response" (chosen/better)
-      - "r_response" (rejected/worse)
-    Writes out a JSONL file with one record per line:
-      {"prompt": "...", "chosen": "...", "rejected": "..."}
-    """
-    data = json.load(open(input_json_path, 'r'))
-    with open(output_jsonl_path, 'w') as fout:
-        for item in data:
-            record = {
-                "prompt": item["prompt"].strip(),
-                "chosen": item["c_response"].strip(),
-                "rejected": item["r_response"].strip()
-            }
-            fout.write(json.dumps(record) + "\n")
-
-if __name__ == "__main__":
-    prepare_pairwise_jsonl(
-        input_json_path="grader_dataset.json",
-        output_jsonl_path="reward_pairs.jsonl"
-    )
-    print("Wrote reward_pairs.jsonl")
-    
-    
-    
-import json
 from pathlib import Path
-from typing import List
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -39,108 +8,111 @@ from transformers import (
     AutoModelForSequenceClassification,
     AdamW
 )
+from peft import LoraConfig, get_peft_model, TaskType
 
 class PairwiseRewardDataset(Dataset):
-    def __init__(self, jsonl_path: str, tokenizer, max_length: int = 256):
-        self.examples = [json.loads(line) for line in open(jsonl_path)]
-        self.tokenizer = tokenizer
+    def __init__(self, jsonl_path, tokenizer, max_length=256):
+        self.examples = [json.loads(l) for l in open(jsonl_path)]
+        self.tok = tokenizer
         self.max_length = max_length
 
-    def __len__(self):
-        return len(self.examples)
+    def __len__(self): return len(self.examples)
 
-    def __getitem__(self, idx):
-        ex = self.examples[idx]
-        # concatenate prompt + response for each
-        prompt = ex["prompt"]
-        chosen = self.tokenizer(
-            prompt + ex["chosen"],
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length",
-            return_tensors="pt",
-        )
-        rejected = self.tokenizer(
-            prompt + ex["rejected"],
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length",
-            return_tensors="pt",
-        )
+    def __getitem__(self, i):
+        ex = self.examples[i]
+        p, c, r = ex["prompt"], ex["chosen"], ex["rejected"]
+        # tokenize prompt+response
+        chosen = self.tok(p + c,
+                          truncation=True,
+                          padding="max_length",
+                          max_length=self.max_length,
+                          return_tensors="pt")
+        rejected = self.tok(p + r,
+                            truncation=True,
+                            padding="max_length",
+                            max_length=self.max_length,
+                            return_tensors="pt")
         return {
-            "input_ids_chosen": chosen.input_ids.squeeze(0),
-            "attention_mask_chosen": chosen.attention_mask.squeeze(0),
-            "input_ids_rejected": rejected.input_ids.squeeze(0),
-            "attention_mask_rejected": rejected.attention_mask.squeeze(0),
+            "input_ids_chosen":    chosen.input_ids[0],
+            "attention_mask_chosen": chosen.attention_mask[0],
+            "input_ids_rejected":   rejected.input_ids[0],
+            "attention_mask_rejected": rejected.attention_mask[0],
         }
 
 def pairwise_loss(score_chosen, score_rejected):
-    # Negative log-sigmoid of the difference
-    diff = score_chosen - score_rejected
-    return -torch.log(torch.sigmoid(diff) + 1e-12).mean()
+    return -torch.log(torch.sigmoid(score_chosen - score_rejected) + 1e-12).mean()
 
-def train_reward_model(
+def train_with_lora(
     jsonl_path: str,
-    model_name: str = "bert-base-uncased",
-    output_dir: str = "./reward_model",
+    base_model: str = "bert-base-uncased",
+    output_dir: str = "./reward_model_lora",
     epochs: int = 3,
     batch_size: int = 16,
-    lr: float = 1e-5,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    lr: float = 1e-4,
+    device: str = "cuda"
 ):
-    # 1) Load tokenizer & model
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # 1) Load tokenizer & base model
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
     model = AutoModelForSequenceClassification.from_pretrained(
-        model_name,
-        num_labels=1,  # single scalar reward
-    ).to(device)
+        base_model,
+        num_labels=1,             # single scalar output
+    )
 
-    # 2) Prepare data
-    dataset = PairwiseRewardDataset(jsonl_path, tokenizer)
-    loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # 2) Wrap with LoRA
+    peft_config = LoraConfig(
+        task_type=TaskType.SEQ_CLS,  # sequence classification
+        inference_mode=False,
+        r=8,                         # rank
+        lora_alpha=16,
+        lora_dropout=0.05,
+    )
+    model = get_peft_model(model, peft_config)
+    model.to(device)
 
-    # 3) Optimizer
+    # 3) Data
+    ds = PairwiseRewardDataset(jsonl_path, tokenizer)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+    # 4) Optimizer
     optimizer = AdamW(model.parameters(), lr=lr)
 
     model.train()
     for epoch in range(1, epochs+1):
         total_loss = 0.0
-        for batch in loader:
+        for batch in dl:
             optimizer.zero_grad()
-            # move data to device
-            for k, v in batch.items():
-                batch[k] = v.to(device)
+            for k,v in batch.items(): batch[k] = v.to(device)
 
-            # forward pass for chosen & rejected
-            logits_chosen = model(
+            # forward chosen / rejected
+            sc = model(
                 input_ids=batch["input_ids_chosen"],
-                attention_mask=batch["attention_mask_chosen"]
+                attention_mask=batch["attention_mask_chosen"],
             ).logits.squeeze(-1)
-            logits_rejected = model(
+            sr = model(
                 input_ids=batch["input_ids_rejected"],
-                attention_mask=batch["attention_mask_rejected"]
+                attention_mask=batch["attention_mask_rejected"],
             ).logits.squeeze(-1)
 
-            # compute pairwise loss
-            loss = pairwise_loss(logits_chosen, logits_rejected)
+            loss = pairwise_loss(sc, sr)
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
 
-        avg_loss = total_loss / len(loader)
-        print(f"Epoch {epoch:>2} — Avg Pairwise Loss: {avg_loss:.4f}")
+        avg = total_loss / len(dl)
+        print(f"Epoch {epoch} — Pairwise Loss: {avg:.4f}")
 
-    # 4) Save
+    # 5) Save the LoRA adapters (and base config)
     Path(output_dir).mkdir(exist_ok=True, parents=True)
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-    print(f"Saved reward model to {output_dir}")
+    print(f"✅ Saved LoRA-adapted model to {output_dir}")
 
 if __name__ == "__main__":
-    train_reward_model(
+    train_with_lora(
         jsonl_path="reward_pairs.jsonl",
-        model_name="bert-base-uncased",
+        base_model="bert-base-uncased",
         epochs=3,
-        batch_size=16
+        batch_size=8,    # you can go smaller
+        lr=3e-4
     )
