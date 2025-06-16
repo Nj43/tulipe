@@ -1,158 +1,146 @@
-import os
+import json
+
+def prepare_pairwise_jsonl(input_json_path: str, output_jsonl_path: str):
+    """
+    Reads a JSON list where each item has fields:
+      - "prompt"
+      - "c_response" (chosen/better)
+      - "r_response" (rejected/worse)
+    Writes out a JSONL file with one record per line:
+      {"prompt": "...", "chosen": "...", "rejected": "..."}
+    """
+    data = json.load(open(input_json_path, 'r'))
+    with open(output_jsonl_path, 'w') as fout:
+        for item in data:
+            record = {
+                "prompt": item["prompt"].strip(),
+                "chosen": item["c_response"].strip(),
+                "rejected": item["r_response"].strip()
+            }
+            fout.write(json.dumps(record) + "\n")
+
+if __name__ == "__main__":
+    prepare_pairwise_jsonl(
+        input_json_path="grader_dataset.json",
+        output_jsonl_path="reward_pairs.jsonl"
+    )
+    print("Wrote reward_pairs.jsonl")
+    
+    
+    
+import json
+from pathlib import Path
+from typing import List
+
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    PreTrainedModel,
-    PretrainedConfig,
-    Trainer,
-    TrainingArguments,
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    AdamW
 )
-from typing import List, Dict
 
-# 1) A tiny reward head on top of LLaMA-2-7B-Chat
-class RewardHeadConfig(PretrainedConfig):
-    model_type = "reward_head"
-    def __init__(self, base_model_name: str = "meta-llama/Llama-2-7b-chat-hf", **kwargs):
-        super().__init__(**kwargs)
-        self.base_model_name = base_model_name
-
-class RewardHeadModel(PreTrainedModel):
-    config_class = RewardHeadConfig
-
-    def __init__(self, config: RewardHeadConfig):
-        super().__init__(config)
-        # load LLaMA as a causal LM
-        base_cfg = AutoConfig.from_pretrained(config.base_model_name)
-        self.base_model = AutoModelForCausalLM.from_pretrained(
-            config.base_model_name, config=base_cfg, torch_dtype=torch.float16, low_cpu_mem_usage=True
-        )
-        hidden_size = base_cfg.hidden_size
-        # a little MLP to score the pooled hidden state
-        self.score = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.Tanh(),
-            nn.Linear(hidden_size, 1),
-        )
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        attention_mask: torch.LongTensor,
-        **kwargs,
-    ) -> torch.FloatTensor:
-        # get last hidden states from the causal LM
-        outputs = self.base_model.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        # mean‐pool the last hidden state
-        last_h = outputs.hidden_states[-1]  # (B, L, H)
-        masked = last_h * attention_mask.unsqueeze(-1)
-        pooled = masked.sum(1) / attention_mask.sum(1, keepdim=True)
-        # project to a scalar
-        reward = self.score(pooled).squeeze(-1)  # (B,)
-        return reward
-
-# 2) A Dataset that returns dicts with chosen/rejected fields
-class PairwiseDataset(Dataset):
-    def __init__(self, path: str, tokenizer):
-        import json
-        data = json.load(open(path))
-        self.examples = data  # list of dict with prompt, chosen, rejected texts
+class PairwiseRewardDataset(Dataset):
+    def __init__(self, jsonl_path: str, tokenizer, max_length: int = 256):
+        self.examples = [json.loads(line) for line in open(jsonl_path)]
         self.tokenizer = tokenizer
+        self.max_length = max_length
 
     def __len__(self):
         return len(self.examples)
 
-    def __getitem__(self, i: int) -> Dict[str, torch.Tensor]:
-        ex = self.examples[i]
-        # assume each has ex["chosen_text"], ex["rejected_text"]
-        c = self.tokenizer(
-            ex["chosen_text"],
+    def __getitem__(self, idx):
+        ex = self.examples[idx]
+        # concatenate prompt + response for each
+        prompt = ex["prompt"]
+        chosen = self.tokenizer(
+            prompt + ex["chosen"],
             truncation=True,
-            max_length=512,
+            max_length=self.max_length,
             padding="max_length",
             return_tensors="pt",
         )
-        r = self.tokenizer(
-            ex["rejected_text"],
+        rejected = self.tokenizer(
+            prompt + ex["rejected"],
             truncation=True,
-            max_length=512,
+            max_length=self.max_length,
             padding="max_length",
             return_tensors="pt",
         )
         return {
-            "chosen_input_ids":   c.input_ids.squeeze(0),
-            "chosen_attention_mask": c.attention_mask.squeeze(0),
-            "rejected_input_ids":   r.input_ids.squeeze(0),
-            "rejected_attention_mask": r.attention_mask.squeeze(0),
+            "input_ids_chosen": chosen.input_ids.squeeze(0),
+            "attention_mask_chosen": chosen.attention_mask.squeeze(0),
+            "input_ids_rejected": rejected.input_ids.squeeze(0),
+            "attention_mask_rejected": rejected.attention_mask.squeeze(0),
         }
 
-# 3) A simple collator stacks them
-def collate_fn(features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    batch = {}
-    for k in features[0]:
-        batch[k] = torch.stack([f[k] for f in features])
-    return batch
+def pairwise_loss(score_chosen, score_rejected):
+    # Negative log-sigmoid of the difference
+    diff = score_chosen - score_rejected
+    return -torch.log(torch.sigmoid(diff) + 1e-12).mean()
 
-# 4) Custom Trainer with margin ranking loss
-class RewardTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
-        # inputs: dict of four (B, L) tensors
-        chosen_r = model(
-            input_ids=inputs["chosen_input_ids"],
-            attention_mask=inputs["chosen_attention_mask"],
-        )
-        rejected_r = model(
-            input_ids=inputs["rejected_input_ids"],
-            attention_mask=inputs["rejected_attention_mask"],
-        )
-        # we want chosen_r > rejected_r by margin=1.0
-        target = torch.ones_like(chosen_r)
-        loss_fct = nn.MarginRankingLoss(margin=1.0)
-        loss = loss_fct(chosen_r, rejected_r, target)
-        return (loss, (chosen_r, rejected_r)) if return_outputs else loss
+def train_reward_model(
+    jsonl_path: str,
+    model_name: str = "bert-base-uncased",
+    output_dir: str = "./reward_model",
+    epochs: int = 3,
+    batch_size: int = 16,
+    lr: float = 1e-5,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+):
+    # 1) Load tokenizer & model
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=1,  # single scalar reward
+    ).to(device)
 
-# === Main ===
+    # 2) Prepare data
+    dataset = PairwiseRewardDataset(jsonl_path, tokenizer)
+    loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # 3) Optimizer
+    optimizer = AdamW(model.parameters(), lr=lr)
+
+    model.train()
+    for epoch in range(1, epochs+1):
+        total_loss = 0.0
+        for batch in loader:
+            optimizer.zero_grad()
+            # move data to device
+            for k, v in batch.items():
+                batch[k] = v.to(device)
+
+            # forward pass for chosen & rejected
+            logits_chosen = model(
+                input_ids=batch["input_ids_chosen"],
+                attention_mask=batch["attention_mask_chosen"]
+            ).logits.squeeze(-1)
+            logits_rejected = model(
+                input_ids=batch["input_ids_rejected"],
+                attention_mask=batch["attention_mask_rejected"]
+            ).logits.squeeze(-1)
+
+            # compute pairwise loss
+            loss = pairwise_loss(logits_chosen, logits_rejected)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(loader)
+        print(f"Epoch {epoch:>2} — Avg Pairwise Loss: {avg_loss:.4f}")
+
+    # 4) Save
+    Path(output_dir).mkdir(exist_ok=True, parents=True)
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"Saved reward model to {output_dir}")
+
 if __name__ == "__main__":
-    from transformers import LlamaTokenizer
-
-    model_name = "meta-llama/Llama-2-7b-chat-hf"
-    tokenizer = LlamaTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # load your JSON pairwise data
-    train_ds = PairwiseDataset("phase3.1_train.json", tokenizer)
-    eval_ds  = PairwiseDataset("phase3.1_valid.json", tokenizer)
-
-    config = RewardHeadConfig(base_model_name=model_name)
-    model = RewardHeadModel(config).to("cuda")
-
-    training_args = TrainingArguments(
-        output_dir="llama-reward-model",
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
-        gradient_accumulation_steps=8,
-        num_train_epochs=2,
-        learning_rate=2e-5,
-        fp16=True,
-        evaluation_strategy="steps",
-        eval_steps=500,
-        save_steps=1000,
-        logging_steps=100,
+    train_reward_model(
+        jsonl_path="reward_pairs.jsonl",
+        model_name="bert-base-uncased",
+        epochs=3,
+        batch_size=16
     )
-
-    trainer = RewardTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        data_collator=collate_fn,
-    )
-
-    trainer.train()
