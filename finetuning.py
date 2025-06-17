@@ -1,118 +1,85 @@
-import json
-from pathlib import Path
-
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.nn import BCEWithLogitsLoss
+from torch.utils.data import DataLoader
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
-    AdamW
+    Trainer,
+    TrainingArguments,
 )
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model
 
-class PairwiseRewardDataset(Dataset):
-    def __init__(self, jsonl_path, tokenizer, max_length=256):
-        self.examples = [json.loads(l) for l in open(jsonl_path)]
-        self.tok = tokenizer
-        self.max_length = max_length
+# 1. load tokenizer & base model
+tokenizer = AutoTokenizer.from_pretrained("tiiuae/falcon-7b-instruct", trust_remote_code=True)
+base = AutoModelForSequenceClassification.from_pretrained(
+    "tiiuae/falcon-7b-instruct",
+    num_labels=1,  # we’ll output a *single* scalar score
+    torch_dtype=torch.float16,
+).cuda()
 
-    def __len__(self): return len(self.examples)
+# 2. wrap in LoRA
+lora_cfg = LoraConfig(
+    r=16, lora_alpha=32, target_modules=["q_proj","v_proj"],  # Falcon’s attention proj.
+    lora_dropout=0.05, bias="none",
+)
+reward_model = get_peft_model(base, lora_cfg)
+reward_model.print_trainable_parameters()
 
-    def __getitem__(self, i):
-        ex = self.examples[i]
-        p, c, r = ex["prompt"], ex["chosen"], ex["rejected"]
-        # tokenize prompt+response
-        chosen = self.tok(p + c,
-                          truncation=True,
-                          padding="max_length",
-                          max_length=self.max_length,
-                          return_tensors="pt")
-        rejected = self.tok(p + r,
-                            truncation=True,
-                            padding="max_length",
-                            max_length=self.max_length,
-                            return_tensors="pt")
-        return {
-            "input_ids_chosen":    chosen.input_ids[0],
-            "attention_mask_chosen": chosen.attention_mask[0],
-            "input_ids_rejected":   rejected.input_ids[0],
-            "attention_mask_rejected": rejected.attention_mask[0],
-        }
-
-def pairwise_loss(score_chosen, score_rejected):
-    return -torch.log(torch.sigmoid(score_chosen - score_rejected) + 1e-12).mean()
-
-def train_with_lora(
-    jsonl_path: str,
-    base_model: str = "bert-base-uncased",
-    output_dir: str = "./reward_model_lora",
-    epochs: int = 3,
-    batch_size: int = 16,
-    lr: float = 1e-4,
-    device: str = "cuda"
-):
-    # 1) Load tokenizer & base model
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        base_model,
-        num_labels=1,             # single scalar output
+# 3. collate function: encode prompt+response, return two inputs
+def collate_fn(batch):
+    # each item: {"prompt":…, "chosen":…, "rejected":…}
+    enc = tokenizer(
+        [b["prompt"] + "\n" + b["chosen"]     for b in batch],
+        [b["prompt"] + "\n" + b["rejected"]   for b in batch],
+        padding="longest", truncation=True, return_tensors="pt",
     )
+    # enc.input_ids is shape (2*B, L)
+    # so we split:
+    B = len(batch)
+    input_ids = enc.input_ids.view(2, B, -1).transpose(0,1)    # (B, 2, L)
+    attn_mask = enc.attention_mask.view(2, B, -1).transpose(0,1)
+    return {
+      "input_ids_chosen":     input_ids[:,0].cuda(),
+      "attention_mask_chosen":attn_mask[:,0].cuda(),
+      "input_ids_rejected":   input_ids[:,1].cuda(),
+      "attention_mask_rejected":attn_mask[:,1].cuda(),
+    }
 
-    # 2) Wrap with LoRA
-    peft_config = LoraConfig(
-        task_type=TaskType.SEQ_CLS,  # sequence classification
-        inference_mode=False,
-        r=8,                         # rank
-        lora_alpha=16,
-        lora_dropout=0.05,
-    )
-    model = get_peft_model(model, peft_config)
-    model.to(device)
+# 4. define a custom Trainer to optimize pairwise logistic loss
+class RewardTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        # forward
+        out_ch = model(
+            input_ids=inputs["input_ids_chosen"],
+            attention_mask=inputs["attention_mask_chosen"],
+        ).logits.view(-1)    # (B,)
+        out_rj = model(
+            input_ids=inputs["input_ids_rejected"],
+            attention_mask=inputs["attention_mask_rejected"],
+        ).logits.view(-1)    # (B,)
 
-    # 3) Data
-    ds = PairwiseRewardDataset(jsonl_path, tokenizer)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
+        # pairwise logistic loss: −log σ(s₊ − s₋)
+        diff = out_ch - out_rj
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(diff, torch.ones_like(diff))
+        return (loss, out_ch) if return_outputs else loss
 
-    # 4) Optimizer
-    optimizer = AdamW(model.parameters(), lr=lr)
+# 5. prepare data loader
+train_loader = DataLoader(your_reward_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
 
-    model.train()
-    for epoch in range(1, epochs+1):
-        total_loss = 0.0
-        for batch in dl:
-            optimizer.zero_grad()
-            for k,v in batch.items(): batch[k] = v.to(device)
-
-            # forward chosen / rejected
-            sc = model(
-                input_ids=batch["input_ids_chosen"],
-                attention_mask=batch["attention_mask_chosen"],
-            ).logits.squeeze(-1)
-            sr = model(
-                input_ids=batch["input_ids_rejected"],
-                attention_mask=batch["attention_mask_rejected"],
-            ).logits.squeeze(-1)
-
-            loss = pairwise_loss(sc, sr)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-
-        avg = total_loss / len(dl)
-        print(f"Epoch {epoch} — Pairwise Loss: {avg:.4f}")
-
-    # 5) Save the LoRA adapters (and base config)
-    Path(output_dir).mkdir(exist_ok=True, parents=True)
-    model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    print(f"✅ Saved LoRA-adapted model to {output_dir}")
-
-if __name__ == "__main__":
-    train_with_lora(
-        jsonl_path="reward_pairs.jsonl",
-        base_model="bert-base-uncased",
-        epochs=3,
-        batch_size=8,    # you can go smaller
-        lr=3e-4
-    )
+# 6. train
+trainer = RewardTrainer(
+    model=reward_model,
+    args=TrainingArguments(
+        output_dir="rm-lora",
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=4,
+        max_steps=2000,
+        fp16=True,
+        logging_steps=50,
+        save_steps=500,
+    ),
+    train_dataset=your_reward_dataset,
+    data_collator=collate_fn,
+)
+trainer.train()
+reward_model.save_pretrained("rm-lora")
