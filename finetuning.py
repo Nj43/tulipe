@@ -1,127 +1,163 @@
-#!/usr/bin/env python3
-import json
-import os
-from pathlib import Path
+#!/usr/bin/env python
+# train_reward_model_lora.py
 
-import torch
-from datasets import Dataset
+import os
+import json
+from datasets import Dataset, load_dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
     TrainingArguments,
+    default_data_collator,
 )
-from trl import RewardTrainer, RewardConfig
+from peft import (
+    LoraConfig,
+    TaskType,
+    get_peft_model,
+)
+from trl import RewardTrainer
 
-def load_comparison_json(path):
-    """Load your JSON comparison data, filter out any records
-       missing either c_response or r_response."""
-    raw = json.load(open(path, 'r', encoding='utf-8'))
-    examples = []
-    for rec in raw:
-        prompt = rec.get("prompt", "").strip()
-        chosen = rec.get("c_response", "").strip()
-        rejected = rec.get("r_response", "").strip()
-        # simple sanity check
-        if prompt and chosen and rejected:
-            examples.append({
-                "prompt": prompt,
-                "chosen": chosen,
-                "rejected": rejected
-            })
-    return examples
+def load_jsonl(path):
+    """Load a .jsonl file into a list of dicts."""
+    with open(path, "r", encoding="utf-8") as f:
+        return [json.loads(line) for line in f]
 
-def make_dataset(examples, tokenizer, max_length=512):
-    """Turn the list of dicts into a Hugging Face Dataset suitable for RewardTrainer.
-       RewardTrainer expects columns ['input_ids', 'attention_mask', 'labels'] for both
-       chosen and rejected, so we return a Dataset with two fields:
-         - 'chosen_input_ids', 'chosen_attention_mask'
-         - 'rejected_input_ids', 'rejected_attention_mask'
+def build_dataset(data):
     """
-    def tokenize_pair(ex):
-        # concatenate prompt + response
-        chosen_enc = tokenizer(
-            ex["prompt"],
-            ex["chosen"],
-            truncation=True,
-            max_length=max_length,
-            padding="max_length",
-        )
-        rejected_enc = tokenizer(
-            ex["prompt"],
-            ex["rejected"],
-            truncation=True,
-            max_length=max_length,
-            padding="max_length",
-        )
-        return {
-            "chosen_input_ids": chosen_enc["input_ids"],
-            "chosen_attention_mask": chosen_enc["attention_mask"],
-            "rejected_input_ids": rejected_enc["input_ids"],
-            "rejected_attention_mask": rejected_enc["attention_mask"],
-        }
+    Expect each item in data to have keys:
+      - prompt:      the instruction+context
+      - c_response:  the preferred (chosen) model output
+      - r_response:  the rejected output
+    """
+    records = {
+        "prompt":   [item["prompt"]     for item in data],
+        "chosen":   [item["c_response"] for item in data],
+        "rejected": [item["r_response"] for item in data],
+    }
+    return Dataset.from_dict(records)
 
-    ds = Dataset.from_list(examples)
-    ds = ds.map(tokenize_pair, remove_columns=ds.column_names)
-    return ds
+def tokenize_for_reward(examples, tokenizer, max_length=512):
+    """
+    Create the four fields that trl.RewardTrainer expects:
+      input_ids_chosen, attention_mask_chosen,
+      input_ids_rejected, attention_mask_rejected
+    """
+    chosen = tokenizer(
+        examples["prompt"],
+        examples["chosen"],
+        truncation=True,
+        padding="max_length",
+        max_length=max_length,
+    )
+    rejected = tokenizer(
+        examples["prompt"],
+        examples["rejected"],
+        truncation=True,
+        padding="max_length",
+        max_length=max_length,
+    )
+    return {
+        "input_ids_chosen":   chosen["input_ids"],
+        "attention_mask_chosen":   chosen["attention_mask"],
+        "input_ids_rejected": rejected["input_ids"],
+        "attention_mask_rejected": rejected["attention_mask"],
+    }
 
 def main():
-    data_path = "comparison_data.json"  # your JSON file
-    output_dir = "reward_model"
-    base_model = "distilroberta-base"   # or your preferred backbone
+    ###### 1. Paths & Hyperparams ######
+    jsonl_path = "reward_data.jsonl"           # your comparison data
+    output_dir = "reward_model_lora"           # where to save the LoRA-adapted reward model
+    base_model  = "tiiuae/falcon-7b-instruct"  # reward‐backbone
+    peft_r      = 8
+    peft_alpha  = 16
+    peft_dropout= 0.1
 
-    # 1) Load data
-    examples = load_comparison_json(data_path)
-    print(f"> Loaded {len(examples)} comparison examples")
+    train_batch_size = 4
+    eval_batch_size  = 4
+    num_train_epochs = 3
+    logging_steps    = 50
+    save_steps       = 500
+    eval_steps       = 200
+    max_length       = 512
 
-    # 2) Load tokenizer & model
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    ###### 2. Load & Build Dataset ######
+    raw = load_jsonl(jsonl_path)
+    ds  = build_dataset(raw)
+    # split 90/10
+    ds = ds.train_test_split(test_size=0.1, seed=42)
+    train_ds, eval_ds = ds["train"], ds["test"]
+
+    ###### 3. Tokenizer & Model ######
+    print("Loading tokenizer and model…")
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+    # ensure tokenization pads to max_length
+    tokenizer.padding_side = "right"
+    tokenizer.model_max_length = max_length
+
     model = AutoModelForSequenceClassification.from_pretrained(
-        base_model, num_labels=1
+        base_model,
+        num_labels=1,             # single scalar reward
+        torch_dtype="auto",       # let HF pick float16 if available
+        trust_remote_code=True,
     )
 
-    # 3) Build HF Dataset
-    ds = make_dataset(examples, tokenizer)
-    # split
-    split = ds.train_test_split(test_size=0.1, seed=42)
-    train_ds, eval_ds = split["train"], split["test"]
-    print(f"> Train size: {len(train_ds)}, Eval size: {len(eval_ds)}")
+    ###### 4. Apply LoRA via PEFT ######
+    peft_config = LoraConfig(
+        task_type=TaskType.SEQ_CLS,
+        inference_mode=False,
+        r=peft_r,
+        lora_alpha=peft_alpha,
+        lora_dropout=peft_dropout,
+        target_modules=["q_proj", "v_proj"],  # Falcon‐style attention proj modules
+    )
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()
 
-    # 4) Configure RewardTrainer
-    reward_config = RewardConfig(
-        # the name of the column with chosen vs rejected features:
-        # by default, RewardTrainer looks for:
-        #   - "chosen_input_ids", "chosen_attention_mask"
-        #   - "rejected_input_ids", "rejected_attention_mask"
-        reward_tokenizer=tokenizer,
+    ###### 5. Preprocess the data ######
+    print("Tokenizing data…")
+    train_ds = train_ds.map(
+        lambda x: tokenize_for_reward(x, tokenizer, max_length),
+        batched=True,
+        remove_columns=train_ds.column_names,
+    )
+    eval_ds = eval_ds.map(
+        lambda x: tokenize_for_reward(x, tokenizer, max_length),
+        batched=True,
+        remove_columns=eval_ds.column_names,
     )
 
+    ###### 6. Setup TrainingArguments ######
     training_args = TrainingArguments(
         output_dir=output_dir,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
-        num_train_epochs=3,
-        logging_steps=100,
+        num_train_epochs=num_train_epochs,
+        per_device_train_batch_size=train_batch_size,
+        per_device_eval_batch_size=eval_batch_size,
+        logging_steps=logging_steps,
         evaluation_strategy="steps",
-        eval_steps=200,
+        eval_steps=eval_steps,
+        save_steps=save_steps,
         save_total_limit=2,
-        learning_rate=1e-5,
-        fp16=torch.cuda.is_available(),
-        logging_dir=f"{output_dir}/logs",
+        learning_rate=2e-5,
+        fp16=True,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
     )
 
+    ###### 7. RewardTrainer ######
     trainer = RewardTrainer(
         model=model,
+        tokenizer=tokenizer,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        tokenizer=tokenizer,
-        reward_config=reward_config,
+        data_collator=default_data_collator,
     )
 
-    # 5) Train!
+    ###### 8. Train! ######
     trainer.train()
     trainer.save_model(output_dir)
-    print(f">>> Reward model saved to {output_dir}")
+
+    print(f"\n✅ Finished. Your LoRA‐adapted reward model is in `{output_dir}`")
 
 if __name__ == "__main__":
     main()
