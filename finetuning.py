@@ -1,122 +1,91 @@
-# train_reward_model_lora.py
-
-import json
-from pathlib import Path
-
+# data_preprocess.py
+from datasets import load_dataset
 import torch
-from datasets import Dataset
-from transformers import (
-    AutoTokenizer,
-    AutoModelForSequenceClassification,
-    TrainingArguments,
-)
-from peft import LoraConfig, get_peft_model, TaskType
-from trl import RewardTrainer, RewardConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model
+from trl import SFTTrainer, SFTConfig
+from datasets import load_from_disk
 
-# ──────────────────────────────────────────────────────────────────────────────
-#                  1)  CONFIGURE PATHS & HYPERPARAMETERS
-# ──────────────────────────────────────────────────────────────────────────────
-DATA_JSON = "comparison_data.json"      # ← your JSON file
-OUTPUT_DIR = "falcon7b_reward_lora"     # where to save adapters & tokenizer
+ds = load_dataset("json", data_files="data/train.json", field=None)
 
-MODEL_NAME = "tiiuae/falcon-7b-instruct"
-BATCH_SIZE = 4
-LR = 1e-4
-EPOCHS = 3
-LOGGING_STEPS = 50
-SAVE_STEPS = 200
+# We only want the “good” responses for SFT
+def extract_fields(example):
+    return {
+      "input": example["prompt"],
+      "target": example["c_response"]+"\n"  # include trailing newline for EOS
+    }
 
-# LoRA
-LORA_R = 8
-LORA_ALPHA = 16
-LORA_DROPOUT = 0.05
-TARGET_MODULES = ["q_proj", "v_proj"]   # adjust if necessary
+ds = ds["train"].map(extract_fields, remove_columns=ds["train"].column_names)
+ds = ds.train_test_split(test_size=0.05, seed=42)
+ds["train"].save_to_disk("data/sft/train")
+ds["test"].save_to_disk("data/sft/test")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#     2)  LOAD & PREP DATASET
-# ──────────────────────────────────────────────────────────────────────────────
-raw = json.load(open(DATA_JSON))   # list of dicts
-records = []
-for rec in raw:
-    prompt  = rec["prompt"].strip()
-    chosen  = rec["c_response"].strip()
-    rejected= rec["r_response"].strip()
-    records.append({"prompt": prompt, "chosen": chosen, "rejected": rejected})
-
-ds = Dataset.from_list(records)
-# simple 90/10 split
-ds = ds.train_test_split(test_size=0.1)
-train_ds = ds["train"]
-eval_ds  = ds["test"]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3)  TOKENIZER & BASE MODEL → reward head (1‐dim)
-# ──────────────────────────────────────────────────────────────────────────────
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME,  padding_side="right")
-tokenizer.pad_token = tokenizer.eos_token
+# 1) Load tokeniser & model
+model_name = "meta-llama/Llama-2-7b-hf"  # or your LLaMA7B HF path
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+tokenizer.pad_token_id = tokenizer.eos_token_id
 
-model = AutoModelForSequenceClassification.from_pretrained(
-    MODEL_NAME,
-    num_labels=1,
-    torch_dtype=torch.float16
+base = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    load_in_4bit=True,           # bitsandbytes quant
+    device_map="auto",
+    quantization_config={"bnb_4bit_compute_dtype": torch.float16}
 )
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-#               4)  WRAP WITH LoRA (peft)
-# ──────────────────────────────────────────────────────────────────────────────
+# 2) Attach LoRA
 lora_cfg = LoraConfig(
-    task_type       = TaskType.SEQ_CLS,
-    inference_mode  = False,
-    r               = LORA_R,
-    lora_alpha      = LORA_ALPHA,
-    lora_dropout    = LORA_DROPOUT,
-    target_modules  = TARGET_MODULES,
+    r=8,
+    lora_alpha=16,
+    target_modules=["q_proj","v_proj"],  # Llama-2 KV/QV projection modules
+    lora_dropout=0.05,
+    bias="none"
 )
-model = get_peft_model(model, lora_cfg)
+model = get_peft_model(base, lora_cfg)
 
+# 3) Load datasets
+train_ds = load_from_disk("data/sft/train")
+test_ds  = load_from_disk("data/sft/test")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 5)  DEFINE TrainingArguments & RewardTrainer
-# ──────────────────────────────────────────────────────────────────────────────
-training_args = TrainingArguments(
-    output_dir              = OUTPUT_DIR,
-    per_device_train_batch_size = BATCH_SIZE,
-    per_device_eval_batch_size  = BATCH_SIZE,
-    gradient_accumulation_steps = 1,
-    learning_rate           = LR,
-    num_train_epochs        = EPOCHS,
-    logging_steps           = LOGGING_STEPS,
-    save_steps              = SAVE_STEPS,
-    save_total_limit        = 2,
-    fp16                    = True,
-    evaluation_strategy     = "steps",
+# 4) SFTTrainer config
+sft_config = SFTConfig(
+    train_batch_size=8,
+    micro_batch_size=4,
+    num_train_epochs=3,
+    learning_rate=3e-4,
+    cutoff_len=512,              # max tokens per example
+    val_set_size= len(test_ds),
+    logging_steps=50,
+    tensorboard_dir="runs/sft_lora",
 )
 
-reward_config = RewardConfig(
-    prompt_column   = "prompt",
-    chosen_column   = "chosen",
-    rejected_column = "rejected",
+# 5) Build the trainer
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=train_ds,
+    eval_dataset=test_ds,
+    args=sft_config,
 )
 
-trainer = RewardTrainer(
-    model           = model,
-    args            = training_args,
-    train_dataset   = train_ds,
-    eval_dataset    = eval_ds,
-    tokenizer       = tokenizer,
-    reward_config   = reward_config,
-)
+# 6) Fine-tune
+trainer.train()
+# 7) Save just the LoRA adapter (small!)
+model.save_pretrained("lora-adapter/llama7b-sft")
 
+"""
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 
-# ──────────────────────────────────────────────────────────────────────────────
-#                        6)  TRAIN & SAVE
-# ──────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    trainer.train()
-    # save LoRA adapters + config
-    model.save_pretrained(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
-    print(f"✅ Saved fine‐tuned reward model at {OUTPUT_DIR}")
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+base = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")
+model = PeftModel.from_pretrained(base, "lora-adapter/llama7b-sft")
+
+prompt = ds["test"][0]["input"]
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+out = model.generate(**inputs, max_new_tokens=100)
+print(tokenizer.decode(out[0], skip_special_tokens=True))
+
+"""
