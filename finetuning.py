@@ -1,85 +1,127 @@
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+
 import torch
-from torch.nn import BCEWithLogitsLoss
-from torch.utils.data import DataLoader
+from datasets import Dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
-    Trainer,
     TrainingArguments,
 )
-from peft import LoraConfig, get_peft_model
+from trl import RewardTrainer, RewardConfig
 
-# 1. load tokenizer & base model
-tokenizer = AutoTokenizer.from_pretrained("tiiuae/falcon-7b-instruct", trust_remote_code=True)
-base = AutoModelForSequenceClassification.from_pretrained(
-    "tiiuae/falcon-7b-instruct",
-    num_labels=1,  # we’ll output a *single* scalar score
-    torch_dtype=torch.float16,
-).cuda()
+def load_comparison_json(path):
+    """Load your JSON comparison data, filter out any records
+       missing either c_response or r_response."""
+    raw = json.load(open(path, 'r', encoding='utf-8'))
+    examples = []
+    for rec in raw:
+        prompt = rec.get("prompt", "").strip()
+        chosen = rec.get("c_response", "").strip()
+        rejected = rec.get("r_response", "").strip()
+        # simple sanity check
+        if prompt and chosen and rejected:
+            examples.append({
+                "prompt": prompt,
+                "chosen": chosen,
+                "rejected": rejected
+            })
+    return examples
 
-# 2. wrap in LoRA
-lora_cfg = LoraConfig(
-    r=16, lora_alpha=32, target_modules=["q_proj","v_proj"],  # Falcon’s attention proj.
-    lora_dropout=0.05, bias="none",
-)
-reward_model = get_peft_model(base, lora_cfg)
-reward_model.print_trainable_parameters()
+def make_dataset(examples, tokenizer, max_length=512):
+    """Turn the list of dicts into a Hugging Face Dataset suitable for RewardTrainer.
+       RewardTrainer expects columns ['input_ids', 'attention_mask', 'labels'] for both
+       chosen and rejected, so we return a Dataset with two fields:
+         - 'chosen_input_ids', 'chosen_attention_mask'
+         - 'rejected_input_ids', 'rejected_attention_mask'
+    """
+    def tokenize_pair(ex):
+        # concatenate prompt + response
+        chosen_enc = tokenizer(
+            ex["prompt"],
+            ex["chosen"],
+            truncation=True,
+            max_length=max_length,
+            padding="max_length",
+        )
+        rejected_enc = tokenizer(
+            ex["prompt"],
+            ex["rejected"],
+            truncation=True,
+            max_length=max_length,
+            padding="max_length",
+        )
+        return {
+            "chosen_input_ids": chosen_enc["input_ids"],
+            "chosen_attention_mask": chosen_enc["attention_mask"],
+            "rejected_input_ids": rejected_enc["input_ids"],
+            "rejected_attention_mask": rejected_enc["attention_mask"],
+        }
 
-# 3. collate function: encode prompt+response, return two inputs
-def collate_fn(batch):
-    # each item: {"prompt":…, "chosen":…, "rejected":…}
-    enc = tokenizer(
-        [b["prompt"] + "\n" + b["chosen"]     for b in batch],
-        [b["prompt"] + "\n" + b["rejected"]   for b in batch],
-        padding="longest", truncation=True, return_tensors="pt",
+    ds = Dataset.from_list(examples)
+    ds = ds.map(tokenize_pair, remove_columns=ds.column_names)
+    return ds
+
+def main():
+    data_path = "comparison_data.json"  # your JSON file
+    output_dir = "reward_model"
+    base_model = "distilroberta-base"   # or your preferred backbone
+
+    # 1) Load data
+    examples = load_comparison_json(data_path)
+    print(f"> Loaded {len(examples)} comparison examples")
+
+    # 2) Load tokenizer & model
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        base_model, num_labels=1
     )
-    # enc.input_ids is shape (2*B, L)
-    # so we split:
-    B = len(batch)
-    input_ids = enc.input_ids.view(2, B, -1).transpose(0,1)    # (B, 2, L)
-    attn_mask = enc.attention_mask.view(2, B, -1).transpose(0,1)
-    return {
-      "input_ids_chosen":     input_ids[:,0].cuda(),
-      "attention_mask_chosen":attn_mask[:,0].cuda(),
-      "input_ids_rejected":   input_ids[:,1].cuda(),
-      "attention_mask_rejected":attn_mask[:,1].cuda(),
-    }
 
-# 4. define a custom Trainer to optimize pairwise logistic loss
-class RewardTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
-        # forward
-        out_ch = model(
-            input_ids=inputs["input_ids_chosen"],
-            attention_mask=inputs["attention_mask_chosen"],
-        ).logits.view(-1)    # (B,)
-        out_rj = model(
-            input_ids=inputs["input_ids_rejected"],
-            attention_mask=inputs["attention_mask_rejected"],
-        ).logits.view(-1)    # (B,)
+    # 3) Build HF Dataset
+    ds = make_dataset(examples, tokenizer)
+    # split
+    split = ds.train_test_split(test_size=0.1, seed=42)
+    train_ds, eval_ds = split["train"], split["test"]
+    print(f"> Train size: {len(train_ds)}, Eval size: {len(eval_ds)}")
 
-        # pairwise logistic loss: −log σ(s₊ − s₋)
-        diff = out_ch - out_rj
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(diff, torch.ones_like(diff))
-        return (loss, out_ch) if return_outputs else loss
+    # 4) Configure RewardTrainer
+    reward_config = RewardConfig(
+        # the name of the column with chosen vs rejected features:
+        # by default, RewardTrainer looks for:
+        #   - "chosen_input_ids", "chosen_attention_mask"
+        #   - "rejected_input_ids", "rejected_attention_mask"
+        reward_tokenizer=tokenizer,
+    )
 
-# 5. prepare data loader
-train_loader = DataLoader(your_reward_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
+        num_train_epochs=3,
+        logging_steps=100,
+        evaluation_strategy="steps",
+        eval_steps=200,
+        save_total_limit=2,
+        learning_rate=1e-5,
+        fp16=torch.cuda.is_available(),
+        logging_dir=f"{output_dir}/logs",
+    )
 
-# 6. train
-trainer = RewardTrainer(
-    model=reward_model,
-    args=TrainingArguments(
-        output_dir="rm-lora",
-        per_device_train_batch_size=8,
-        gradient_accumulation_steps=4,
-        max_steps=2000,
-        fp16=True,
-        logging_steps=50,
-        save_steps=500,
-    ),
-    train_dataset=your_reward_dataset,
-    data_collator=collate_fn,
-)
-trainer.train()
-reward_model.save_pretrained("rm-lora")
+    trainer = RewardTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        tokenizer=tokenizer,
+        reward_config=reward_config,
+    )
+
+    # 5) Train!
+    trainer.train()
+    trainer.save_model(output_dir)
+    print(f">>> Reward model saved to {output_dir}")
+
+if __name__ == "__main__":
+    main()
