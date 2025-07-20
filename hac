@@ -1,55 +1,21 @@
-from crewai import Agent, Task, Crew, Process
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import Chroma
-from langchain.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.llms import OpenAI
-from langchain.chains import RetrievalQA
-
-# 1. Load PDF
-pdf_path = "example.pdf"
-loader = PyPDFLoader(pdf_path)
-pages = loader.load()
-
-# 2. Split text
-splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-docs = splitter.split_documents(pages)
-
-# 3. Create vector store (RAG backend)
-embedding = OpenAIEmbeddings()
-vectorstore = Chroma.from_documents(docs, embedding)
-retriever = vectorstore.as_retriever()
-
-# 4. Define RAG chain
-qa_chain = RetrievalQA.from_chain_type(
-    llm=OpenAI(),
-    retriever=retriever,
-    return_source_documents=True
-)
-
-# 5. Create a CrewAI agent
-pdf_agent = Agent(
-    role="PDF Analyzer",
-    goal="Extract structured and relevant information from PDF documents",
-    backstory="An AI analyst skilled in understanding complex PDF files using retrieval-based methods.",
-    allow_delegation=False,
-    tools=[qa_chain]  # We'll wrap the chain as a tool below
-)
-
-# 6. Define task
 task = Task(
-    description="Analyze the PDF document and extract relevant points, summaries, and any important insights.",
-    expected_output="A summary and structured findings extracted from the document.",
-    agent=pdf_agent
+    description=(
+        "Analyze the provided PDF document and extract the following information:\n"
+        "1. Executive summary or abstract (if present).\n"
+        "2. Key topics or themes discussed.\n"
+        "3. Any statistics, data points, or research findings.\n"
+        "4. Important named entities (organizations, dates, laws, products, etc.).\n"
+        "5. A concise list of questions the document answers.\n\n"
+        "Ensure your analysis is accurate, grounded in the document, and clearly structured."
+    ),
+    expected_output=(
+        "Return your output as a structured JSON object with the following keys:\n"
+        "- 'summary': str\n"
+        "- 'key_topics': list[str]\n"
+        "- 'data_points': list[str]\n"
+        "- 'entities': list[str]\n"
+        "- 'answered_questions': list[str]"
+    ),
+    agent=pdf_agent,
+    context=["PDF content loaded into the vector store and accessible via the RAG tool"]
 )
-
-# 7. Assemble crew
-crew = Crew(
-    agents=[pdf_agent],
-    tasks=[task],
-    process=Process.sequential
-)
-
-# 8. Run the crew
-result = crew.run()
-print(result)
