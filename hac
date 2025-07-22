@@ -1,21 +1,26 @@
-task = Task(
-    description=(
-        "Analyze the provided PDF document and extract the following information:\n"
-        "1. Executive summary or abstract (if present).\n"
-        "2. Key topics or themes discussed.\n"
-        "3. Any statistics, data points, or research findings.\n"
-        "4. Important named entities (organizations, dates, laws, products, etc.).\n"
-        "5. A concise list of questions the document answers.\n\n"
-        "Ensure your analysis is accurate, grounded in the document, and clearly structured."
-    ),
-    expected_output=(
-        "Return your output as a structured JSON object with the following keys:\n"
-        "- 'summary': str\n"
-        "- 'key_topics': list[str]\n"
-        "- 'data_points': list[str]\n"
-        "- 'entities': list[str]\n"
-        "- 'answered_questions': list[str]"
-    ),
-    agent=pdf_agent,
-    context=["PDF content loaded into the vector store and accessible via the RAG tool"]
-)
+import streamlit as st
+
+# Sample list of company names
+company_list = [
+    "Apple", "Amazon", "Alphabet", "Meta", "Microsoft",
+    "Netflix", "Nvidia", "Tesla", "Twitter", "Uber", "Zoom"
+]
+
+# Title
+st.title("Company Name Autocomplete")
+
+# Text input
+search_term = st.text_input("Type a company name:")
+
+# Filter companies
+if search_term:
+    filtered_companies = [c for c in company_list if search_term.lower() in c.lower()]
+else:
+    filtered_companies = company_list  # Show full list initially
+
+# Show selectbox of filtered companies
+selected_company = st.selectbox("Select a company:", filtered_companies)
+
+# Display selection
+if selected_company:
+    st.success(f"You selected: {selected_company}")
